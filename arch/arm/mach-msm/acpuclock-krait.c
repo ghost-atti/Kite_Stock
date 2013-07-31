@@ -34,9 +34,11 @@
 #include <mach/rpm-regulator.h>
 #include <mach/rpm-regulator-smd.h>
 #include <mach/msm_bus.h>
+#include <mach/msm_dcvs.h>
 
 #include "acpuclock.h"
 #include "acpuclock-krait.h"
+#include "avs.h"
 
 #ifdef CONFIG_LGE_PM_LOW_BATT_CHG
 #include <mach/board_lge.h>
@@ -51,6 +53,11 @@
 
 int g_speed_bin;
 int g_pvs_bin;
+
+#if defined(CONFIG_MACH_APQ8064_GK_KR) || defined(CONFIG_MACH_APQ8064_GKATT)\
+		|| defined(CONFIG_MACH_APQ8064_GVDCM) || defined(CONFIG_MACH_APQ8064_GV_KR) || defined(CONFIG_MACH_APQ8064_GKGLOBAL)
+int limit_cpufreq = 0;
+#endif
 
 static DEFINE_MUTEX(driver_lock);
 static DEFINE_SPINLOCK(l2_lock);
@@ -456,30 +463,12 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 	unsigned long flags;
 	int rc = 0;
 
-#if defined(CONFIG_MACH_APQ8064_GK_KR)	|| defined(CONFIG_MACH_APQ8064_GKATT) || defined(CONFIG_MACH_APQ8064_GVDCM)
-	static int count =0;
-	if(count < 400)count++;	
-	
-	if(rate >= 1026000 && count < 400){
-		switch(lge_get_boot_mode()){
-			case LGE_BOOT_MODE_PIFBOOT :
-			case LGE_BOOT_MODE_PIFBOOT2 :
-				rate = 1026000;
-			break;
-			case LGE_BOOT_MODE_FACTORY :
-			case LGE_BOOT_MODE_FACTORY2 :
-			case LGE_BOOT_MODE_NORMAL :
-			case LGE_BOOT_MODE_CHARGER :
-			case LGE_BOOT_MODE_CHARGERLOGO :
-			default :
-				if(rate >= 1134000) rate = 1134000;
-			break;
-		}
+#if defined(CONFIG_MACH_APQ8064_GK_KR) || defined(CONFIG_MACH_APQ8064_GKATT)\
+		|| defined(CONFIG_MACH_APQ8064_GVDCM) || defined(CONFIG_MACH_APQ8064_GV_KR) || defined(CONFIG_MACH_APQ8064_GKGLOBAL)
+	if(limit_cpufreq) {
+		if(rate > 1242000) rate = 1242000;	
 	}
-
-	//printk("PCH_TEST CPU=%d Count=%d, rate=%d\n", cpu, count, (unsigned int)rate);
 #endif
-
 	if (cpu > num_possible_cpus())
 		return -EINVAL;
 
@@ -509,6 +498,12 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 	vdd_data.vdd_dig  = calculate_vdd_dig(tgt);
 	vdd_data.vdd_core = calculate_vdd_core(tgt);
 	vdd_data.ua_core = tgt->ua_core;
+
+	/* Disable AVS before voltage switch */
+	if (reason == SETRATE_CPUFREQ && drv.scalable[cpu].avs_enabled) {
+		AVS_DISABLE(cpu);
+		drv.scalable[cpu].avs_enabled = false;
+	}
 
 	/* Increase VDD levels if needed. */
 	if (reason == SETRATE_CPUFREQ || reason == SETRATE_HOTPLUG) {
@@ -545,6 +540,12 @@ static int acpuclk_krait_set_rate(int cpu, unsigned long rate,
 	/* Drop VDD levels if we can. */
 	decrease_vdd(cpu, &vdd_data, reason);
 
+	/* Re-enable AVS */
+	if (reason == SETRATE_CPUFREQ && tgt->avsdscr_setting) {
+		AVS_ENABLE(cpu, tgt->avsdscr_setting);
+		drv.scalable[cpu].avs_enabled = true;
+	}
+
 	dev_dbg(drv.dev, "ACPU%d speed change complete\n", cpu);
 
 out:
@@ -559,7 +560,7 @@ static struct acpuclk_data acpuclk_krait_data = {
 };
 
 /* Initialize a HFPLL at a given rate and enable it. */
-static void __init hfpll_init(struct scalable *sc,
+static void hfpll_init(struct scalable *sc,
 			      const struct core_speed *tgt_s)
 {
 	dev_dbg(drv.dev, "Initializing HFPLL%d\n", sc - drv.scalable);
@@ -581,12 +582,11 @@ static void __init hfpll_init(struct scalable *sc,
 		writel_relaxed(drv.hfpll_data->droop_val,
 			       sc->hfpll_base + drv.hfpll_data->droop_offset);
 
-	/* Set an initial rate and enable the PLL. */
+	/* Set an initial PLL rate. */
 	hfpll_set_rate(sc, tgt_s);
-	hfpll_enable(sc, false);
 }
 
-static int __cpuinit rpm_regulator_init(struct scalable *sc, enum vregs vreg,
+static int rpm_regulator_init(struct scalable *sc, enum vregs vreg,
 					 int vdd, bool enable)
 {
 	int ret;
@@ -626,7 +626,7 @@ err_get:
 	return ret;
 }
 
-static void __cpuinit rpm_regulator_cleanup(struct scalable *sc,
+static void rpm_regulator_cleanup(struct scalable *sc,
 						enum vregs vreg)
 {
 	if (!sc->vreg[vreg].rpm_reg)
@@ -637,7 +637,7 @@ static void __cpuinit rpm_regulator_cleanup(struct scalable *sc,
 }
 
 /* Voltage regulator initialization. */
-static int __cpuinit regulator_init(struct scalable *sc,
+static int regulator_init(struct scalable *sc,
 				const struct acpu_level *acpu_level)
 {
 	int ret, vdd_mem, vdd_dig, vdd_core;
@@ -710,7 +710,7 @@ err_mem:
 	return ret;
 }
 
-static void __cpuinit regulator_cleanup(struct scalable *sc)
+static void regulator_cleanup(struct scalable *sc)
 {
 	regulator_disable(sc->vreg[VREG_CORE].reg);
 	regulator_put(sc->vreg[VREG_CORE].reg);
@@ -721,7 +721,7 @@ static void __cpuinit regulator_cleanup(struct scalable *sc)
 }
 
 /* Set initial rate for a given core. */
-static int __cpuinit init_clock_sources(struct scalable *sc,
+static int init_clock_sources(struct scalable *sc,
 					 const struct core_speed *tgt_s)
 {
 	u32 regval;
@@ -746,28 +746,30 @@ static int __cpuinit init_clock_sources(struct scalable *sc,
 	regval &= ~(0x3 << 6);
 	set_l2_indirect_reg(sc->l2cpmr_iaddr, regval);
 
-	/* Switch to the target clock source. */
+	/* Enable and switch to the target clock source. */
+	if (tgt_s->src == HFPLL)
+		hfpll_enable(sc, false);
 	set_pri_clk_src(sc, tgt_s->pri_src_sel);
 	sc->cur_speed = tgt_s;
 
 	return 0;
 }
 
-static void __cpuinit fill_cur_core_speed(struct core_speed *s,
+static void fill_cur_core_speed(struct core_speed *s,
 					  struct scalable *sc)
 {
 	s->pri_src_sel = get_l2_indirect_reg(sc->l2cpmr_iaddr) & 0x3;
 	s->pll_l_val = readl_relaxed(sc->hfpll_base + drv.hfpll_data->l_offset);
 }
 
-static bool __cpuinit speed_equal(const struct core_speed *s1,
+static bool speed_equal(const struct core_speed *s1,
 				  const struct core_speed *s2)
 {
 	return (s1->pri_src_sel == s2->pri_src_sel &&
 		s1->pll_l_val == s2->pll_l_val);
 }
 
-static const struct acpu_level __cpuinit *find_cur_acpu_level(int cpu)
+static const struct acpu_level *find_cur_acpu_level(int cpu)
 {
 	struct scalable *sc = &drv.scalable[cpu];
 	const struct acpu_level *l;
@@ -793,7 +795,7 @@ static const struct l2_level __init *find_cur_l2_level(void)
 	return NULL;
 }
 
-static const struct acpu_level __cpuinit *find_min_acpu_level(void)
+static const struct acpu_level *find_min_acpu_level(void)
 {
 	struct acpu_level *l;
 
@@ -804,7 +806,7 @@ static const struct acpu_level __cpuinit *find_min_acpu_level(void)
 	return NULL;
 }
 
-static int __cpuinit per_cpu_init(int cpu)
+static int per_cpu_init(int cpu)
 {
 	struct scalable *sc = &drv.scalable[cpu];
 	const struct acpu_level *acpu_level;
@@ -880,17 +882,6 @@ static void __init bus_init(const struct l2_level *l2_level)
 #define MAX_VDD 1300
 #define MIN_VDD 700
 
-int get_num_freqs(void)
-{
-	int i;
-	int count = 0;
-	
-	for (i = 0; drv.acpu_freq_tbl[i].use_for_scaling; i++)
-		count++;
-		
-	return count;
-}
-
 ssize_t acpuclk_get_vdd_levels_str(char *buf) 
 {
 
@@ -910,31 +901,32 @@ ssize_t acpuclk_get_vdd_levels_str(char *buf)
 ssize_t acpuclk_set_vdd(char *buf) 
 {
 	unsigned int cur_volt;
-	char size_cur[get_num_freqs()];
+	char count[10];
 	int i;
-    int ret = 0;
+    		int ret = 0;
 
 	if (!buf)
 		return -EINVAL;
-		
-	for (i = 0; i < ARRAY_SIZE(size_cur); i++) {
-		ret = sscanf(buf, "%d", &cur_volt);
 
-		if (ret != 1)
-			return -EINVAL;
-			
-		if (cur_volt > MAX_VDD) {
-			pr_info("Voltage Control: new volt is %d and its higher than %d so we set it to MAX_VDD(%d).\n", cur_volt, MAX_VDD, MAX_VDD);
-			cur_volt = MAX_VDD;
-		} else if (cur_volt < MIN_VDD) {
-			pr_info("Voltage Control: new volt is %d and its lower than %d so we set it to MIN_VDD(%d).\n", cur_volt, MIN_VDD, MIN_VDD);
-			cur_volt = MIN_VDD;
-		}	
-				
-		drv.acpu_freq_tbl[i].vdd_core = cur_volt*1000;
-			
-		ret = sscanf(buf, "%s", size_cur);
-		buf += (strlen(size_cur)+1);
+	for (i = 0; i < drv.acpu_freq_tbl[i].speed.khz; i++) {
+        	if (drv.acpu_freq_tbl[i].use_for_scaling) {
+            		ret = sscanf(buf, "%d", &cur_volt);
+        
+            		if (ret != 1)
+                		return -EINVAL;
+        
+            		if (cur_volt > MAX_VDD) {
+                		cur_volt = MAX_VDD;
+            		} else if (cur_volt < MIN_VDD) {
+                		cur_volt = MIN_VDD;
+            		}
+        
+            		drv.acpu_freq_tbl[i].vdd_core = cur_volt*1000;
+                
+            		ret = sscanf(buf, "%s", count);
+            		buf += (strlen(count)+1);
+        	}
+       
 	}
 	return ret;
 }
@@ -976,7 +968,18 @@ static void __init cpufreq_table_init(void)
 static void __init cpufreq_table_init(void) {}
 #endif
 
-static int __cpuinit acpuclk_cpu_callback(struct notifier_block *nfb,
+static void __init dcvs_freq_init(void)
+{
+	int i;
+
+	for (i = 0; drv.acpu_freq_tbl[i].speed.khz != 0; i++)
+		if (drv.acpu_freq_tbl[i].use_for_scaling)
+			msm_dcvs_register_cpu_freq(
+				drv.acpu_freq_tbl[i].speed.khz,
+				drv.acpu_freq_tbl[i].vdd_core / 1000);
+}
+
+static int acpuclk_cpu_callback(struct notifier_block *nfb,
 					    unsigned long action, void *hcpu)
 {
 	static int prev_khz[NR_CPUS];
@@ -985,36 +988,36 @@ static int __cpuinit acpuclk_cpu_callback(struct notifier_block *nfb,
 	unsigned long hot_unplug_khz = acpuclk_krait_data.power_collapse_khz;
 
 	switch (action & ~CPU_TASKS_FROZEN) {
-	case CPU_DEAD:
-		prev_khz[cpu] = acpuclk_krait_get_rate(cpu);
-		/* Fall through. */
-	case CPU_UP_CANCELED:
-		acpuclk_krait_set_rate(cpu, hot_unplug_khz, SETRATE_HOTPLUG);
-		regulator_set_optimum_mode(sc->vreg[VREG_CORE].reg, 0);
-		break;
-	case CPU_UP_PREPARE:
-		if (!sc->initialized) {
-			rc = per_cpu_init(cpu);
-			if (rc)
-				return NOTIFY_BAD;
-			break;
-		}
-		if (WARN_ON(!prev_khz[cpu]))
-			return NOTIFY_BAD;
-		rc = regulator_set_optimum_mode(sc->vreg[VREG_CORE].reg,
-						sc->vreg[VREG_CORE].cur_ua);
-		if (rc < 0)
-			return NOTIFY_BAD;
-		acpuclk_krait_set_rate(cpu, prev_khz[cpu], SETRATE_HOTPLUG);
-		break;
-	default:
-		break;
+		case CPU_DEAD:
+            		prev_khz[cpu] = acpuclk_krait_get_rate(cpu);
+            		/* Fall through. */
+        	case CPU_UP_CANCELED:
+            		acpuclk_krait_set_rate(cpu, hot_unplug_khz, SETRATE_HOTPLUG);
+            		regulator_set_optimum_mode(sc->vreg[VREG_CORE].reg, 0);
+            		break;
+       		case CPU_UP_PREPARE:
+            		if (!sc->initialized) {
+                		rc = per_cpu_init(cpu);
+                		if (rc)
+                    			return NOTIFY_BAD;
+                		break;
+            		}
+            		if (WARN_ON(!prev_khz[cpu]))
+                		return NOTIFY_BAD;
+            		rc = regulator_set_optimum_mode(sc->vreg[VREG_CORE].reg,
+                                            sc->vreg[VREG_CORE].cur_ua);
+            		if (rc < 0)
+                		return NOTIFY_BAD;
+            		acpuclk_krait_set_rate(cpu, prev_khz[cpu], SETRATE_HOTPLUG);
+            		break;
+        	default:
+           		break;
 	}
 
 	return NOTIFY_OK;
 }
 
-static struct notifier_block __cpuinitdata acpuclk_cpu_notifier = {
+static struct notifier_block acpuclk_cpu_notifier = {
 	.notifier_call = acpuclk_cpu_callback,
 };
 
@@ -1032,9 +1035,11 @@ static const int krait_needs_vmin(void)
 
 static void krait_apply_vmin(struct acpu_level *tbl)
 {
-	for (; tbl->speed.khz != 0; tbl++) 
+	for (; tbl->speed.khz != 0; tbl++) {
 		if (tbl->vdd_core < 1150000)
 			tbl->vdd_core = 1150000;
+		tbl->avsdscr_setting = 0;
+	}
 }
 
 static int __init get_speed_bin(u32 pte_efuse)
@@ -1195,6 +1200,7 @@ int __init acpuclk_krait_init(struct device *dev,
 	hw_init();
 
 	cpufreq_table_init();
+	dcvs_freq_init();
 	acpuclk_register(&acpuclk_krait_data);
 	register_hotcpu_notifier(&acpuclk_cpu_notifier);
 
