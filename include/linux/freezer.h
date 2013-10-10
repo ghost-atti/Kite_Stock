@@ -3,7 +3,6 @@
 #ifndef FREEZER_H_INCLUDED
 #define FREEZER_H_INCLUDED
 
-#include <linux/debug_locks.h>
 #include <linux/sched.h>
 #include <linux/wait.h>
 #include <linux/atomic.h>
@@ -53,16 +52,6 @@ static inline bool try_to_freeze(void)
 	return __refrigerator(false);
 }
 
-<<<<<<< HEAD
-=======
-static inline bool try_to_freeze(void)
-{
-	if (!(current->flags & PF_NOFREEZE))
-		debug_check_no_locks_held();
-	return try_to_freeze_unsafe();
-}
-
->>>>>>> 036cc6f... lockdep: check that no locks held at freeze time
 extern bool freeze_task(struct task_struct *p);
 extern bool set_freezable(void);
 
