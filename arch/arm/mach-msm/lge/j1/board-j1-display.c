@@ -2100,7 +2100,7 @@ static struct backlight_platform_data lm3530_data = {
 	.max_current = 0x17,					//20121107 ej.jung ABS : Exp. -> Linear (0x15 -> 0x17)
 #endif
 	.min_brightness = 0x01,
-	.max_brightness = 0x71,
+	.max_brightness = 0x72,
 	
 };
 #elif defined(CONFIG_BACKLIGHT_LM3533)
